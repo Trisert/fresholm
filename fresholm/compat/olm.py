@@ -90,6 +90,39 @@ def _wrap_encrypted(native_encrypted: _NativeEncryptedMessage):
 
 
 # ---------------------------------------------------------------------------
+# Pending pre-key plaintext registry
+# ---------------------------------------------------------------------------
+#
+# vodozemac decrypts the initial pre-key message at session-creation time and
+# the plaintext is normally served from the per-Session stash
+# (``_stashed_prekey_plaintext``). mautrix's OlmAccount, however, round-trips
+# every session through pickle() -> from_pickle() immediately after creation
+# (see mautrix/crypto/account.py new_inbound_session/new_outbound_session).
+# The stash is intentionally not serialized, so after the round-trip the
+# two-step ``session.decrypt(prekey_msg)`` step fails in the native ratchet
+# ("message key with the given key can't be created, message index: 0").
+#
+# This process-local registry keeps (native session id, prekey ciphertext) ->
+# plaintext so the python-olm two-step contract survives the mautrix
+# round-trip. Entries are consumed on the first matching decrypt; the mapping
+# is bounded to avoid unbounded growth.
+_PENDING_PREKEY_PLAINTEXTS: dict = {}
+_PENDING_PREKEY_MAX = 128
+
+
+def _register_pending_prekey(session, ciphertext: bytes, plaintext: bytes) -> None:
+    """Remember the pre-key plaintext for *session* until its first decrypt."""
+    try:
+        session_id = session.id
+    except Exception:
+        return
+    _PENDING_PREKEY_PLAINTEXTS.pop((session_id, ciphertext), None)
+    _PENDING_PREKEY_PLAINTEXTS[(session_id, ciphertext)] = plaintext
+    while len(_PENDING_PREKEY_PLAINTEXTS) > _PENDING_PREKEY_MAX:
+        _PENDING_PREKEY_PLAINTEXTS.pop(next(iter(_PENDING_PREKEY_PLAINTEXTS)))
+
+
+# ---------------------------------------------------------------------------
 # Account wrapper
 # ---------------------------------------------------------------------------
 
@@ -169,6 +202,9 @@ class Account:
         sess = Session.__new__(Session)
         sess._native = native_session
         sess._stashed_prekey_plaintext = (message.ciphertext, plaintext)
+        # Register by (session id, ciphertext) too, so the pending decrypt still
+        # works after mautrix's pickle round-trip drops the per-instance stash.
+        _register_pending_prekey(sess, message.ciphertext, plaintext)
         return sess
 
     def remove_one_time_keys(self, session) -> None:
@@ -279,7 +315,16 @@ class Session:
             and message.ciphertext == stashed[0]
         ):
             self._stashed_prekey_plaintext = None
+            _PENDING_PREKEY_PLAINTEXTS.pop((self.id, stashed[0]), None)
             return stashed[1].decode("utf-8")
+        # Fallback for a session restored via pickle (mautrix round-trip): the
+        # per-instance stash is gone, but the registry entry keyed by the native
+        # session id survives; serve the pending pre-key plaintext exactly once.
+        if message.message_type == 0:
+            pending = _PENDING_PREKEY_PLAINTEXTS.pop((self.id, message.ciphertext), None)
+            if pending is not None:
+                self._stashed_prekey_plaintext = None
+                return pending.decode("utf-8")
         try:
             plaintext_bytes = self._native.decrypt(message.message_type, message.ciphertext)
         except _NativeOlmSessionError as exc:
@@ -345,7 +390,11 @@ class Session:
 class InboundSession(Session):
     """Inbound Olm session from a received pre-key message."""
     def __init__(self, account, message, identity_key=None):
-        temp = account.new_inbound_session(identity_key, message)
+        # Call the compat implementation explicitly (unbound) instead of
+        # dispatching through account.new_inbound_session: mautrix subclasses
+        # OlmAccount and overrides that method, re-entering this wrapper
+        # (RecursionError / TypeError re-wrapping an OlmPreKeyMessage).
+        temp = Account.new_inbound_session(account, identity_key, message)
         self._native = temp._native
         self._stashed_prekey_plaintext = temp._stashed_prekey_plaintext
 
@@ -353,7 +402,9 @@ class InboundSession(Session):
 class OutboundSession(Session):
     """Outbound Olm session to a recipient."""
     def __init__(self, account, identity_key, one_time_key):
-        temp = account.new_outbound_session(identity_key, one_time_key)
+        # Same rationale as InboundSession: bypass subclass overrides, or
+        # mautrix's OlmAccount wrapper recurses indefinitely.
+        temp = Account.new_outbound_session(account, identity_key, one_time_key)
         self._native = temp._native
         self._stashed_prekey_plaintext = None
 
