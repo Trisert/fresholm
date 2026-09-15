@@ -94,7 +94,10 @@ def _wrap_encrypted(native_encrypted: _NativeEncryptedMessage):
     real clients fails with errors like "invalid pre-key message: expected 3,
     got 65" (base64 text parsed as raw bytes).
     """
-    ciphertext = base64.b64encode(native_encrypted.ciphertext).decode("ascii")
+    ciphertext = base64.b64encode(native_encrypted.ciphertext).decode("ascii").rstrip("=")
+    # Emit UNPADDED base64 like python-olm/libolm and the Matrix wire format.
+    # Padded output breaks libolm's decoder on receive (BAD_MESSAGE_MAC) — only
+    # vodozemac's Indifferent padding mode tolerates it.
     wrapper = OlmPreKeyMessage if native_encrypted.message_type == 0 else OlmMessage
     obj = wrapper.__new__(wrapper)
     obj._ciphertext = ciphertext
