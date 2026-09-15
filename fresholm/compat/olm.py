@@ -108,8 +108,11 @@ def _raw_ciphertext(ciphertext) -> bytes:
     base64) so internal byte-level flows keep working.
     """
     data = ciphertext.encode("utf-8") if isinstance(ciphertext, str) else bytes(ciphertext)
+    # Matrix clients emit unpadded base64; restore padding before the strict decode,
+    # or wire messages whose length isn't divisible by 4 fall through to the raw
+    # passthrough and fail in vodozemac with "expected 3, got 65" ('A' = first b64 char).
     try:
-        return base64.b64decode(data, validate=True)
+        return base64.b64decode(data + b"=" * (-len(data) % 4), validate=True)
     except Exception:
         return data
 
