@@ -23,7 +23,7 @@ impl InboundGroupSession {
         let key = SessionKey::from_base64(session_key)
             .map_err(|e| OlmGroupSessionError::new_err(format!("Invalid session key: {e}")))?;
         Ok(Self {
-            inner: VzInboundGroupSession::new(&key, SessionConfig::version_2()),
+            inner: VzInboundGroupSession::new(&key, SessionConfig::version_1()),
         })
     }
 
@@ -66,7 +66,7 @@ impl InboundGroupSession {
         let key = ExportedSessionKey::from_base64(exported_key)
             .map_err(|e| OlmGroupSessionError::new_err(format!("Invalid exported key: {e}")))?;
         Ok(Self {
-            inner: VzInboundGroupSession::import(&key, SessionConfig::version_2()),
+            inner: VzInboundGroupSession::import(&key, SessionConfig::version_1()),
         })
     }
 

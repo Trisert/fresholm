@@ -78,7 +78,7 @@ impl Account {
             .map_err(|e| OlmAccountError::new_err(format!("Invalid one-time key: {e}")))?;
         let session = self
             .inner
-            .create_outbound_session(SessionConfig::version_2(), identity, otk);
+            .create_outbound_session(SessionConfig::version_1(), identity, otk);
         Ok(Session::from_vz(session))
     }
 

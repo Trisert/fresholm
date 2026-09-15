@@ -19,7 +19,7 @@ impl GroupSession {
     #[new]
     fn new() -> Self {
         Self {
-            inner: VzGroupSession::new(SessionConfig::version_2()),
+            inner: VzGroupSession::new(SessionConfig::version_1()),
         }
     }
 
