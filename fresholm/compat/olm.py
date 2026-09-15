@@ -11,6 +11,8 @@ pickle module). These are safe serialization methods.
 
 from __future__ import annotations
 
+import base64
+
 from fresholm._native import Account as _NativeAccount
 from fresholm._native import EncryptedMessage as _NativeEncryptedMessage
 from fresholm._native import GroupSession as _NativeGroupSession
@@ -83,10 +85,33 @@ class OlmPreKeyMessage:
 
 
 def _wrap_encrypted(native_encrypted: _NativeEncryptedMessage):
-    """Convert a native EncryptedMessage to the appropriate python-olm wrapper."""
-    if native_encrypted.message_type == 0:
-        return OlmPreKeyMessage(native_encrypted.ciphertext)
-    return OlmMessage(native_encrypted.ciphertext)
+    """Convert a native EncryptedMessage to a python-olm wrapper.
+
+    python-olm exposes message ciphertexts as base64 strings (see
+    olm.Session.encrypt returning ``OlmPreKeyMessage("Awog...")``) and real
+    Matrix traffic carries base64, while vodozemac works in raw protobuf
+    bytes. Bridge the two formats here and in _raw_ciphertext, or Olm against
+    real clients fails with errors like "invalid pre-key message: expected 3,
+    got 65" (base64 text parsed as raw bytes).
+    """
+    ciphertext = base64.b64encode(native_encrypted.ciphertext).decode("ascii")
+    wrapper = OlmPreKeyMessage if native_encrypted.message_type == 0 else OlmMessage
+    obj = wrapper.__new__(wrapper)
+    obj._ciphertext = ciphertext
+    return obj
+
+
+def _raw_ciphertext(ciphertext) -> bytes:
+    """Decode a base64 wire ciphertext (str/bytes) to raw bytes for vodozemac.
+
+    Tolerates already-raw input (returned unchanged when it is not valid
+    base64) so internal byte-level flows keep working.
+    """
+    data = ciphertext.encode("utf-8") if isinstance(ciphertext, str) else bytes(ciphertext)
+    try:
+        return base64.b64decode(data, validate=True)
+    except Exception:
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +221,16 @@ class Account:
         Returns:
             A Session object for communicating with the sender.
         """
+        raw_ciphertext = _raw_ciphertext(message.ciphertext)
         native_session, plaintext = self._native.create_inbound_session(
-            sender_key or None, message.ciphertext
+            sender_key or None, raw_ciphertext
         )
         sess = Session.__new__(Session)
         sess._native = native_session
-        sess._stashed_prekey_plaintext = (message.ciphertext, plaintext)
-        # Register by (session id, ciphertext) too, so the pending decrypt still
-        # works after mautrix's pickle round-trip drops the per-instance stash.
-        _register_pending_prekey(sess, message.ciphertext, plaintext)
+        sess._stashed_prekey_plaintext = (raw_ciphertext, plaintext)
+        # Register by (session id, raw ciphertext) too, so the pending decrypt
+        # still works after mautrix's pickle round-trip drops the stash.
+        _register_pending_prekey(sess, raw_ciphertext, plaintext)
         return sess
 
     def remove_one_time_keys(self, session) -> None:
@@ -308,11 +334,12 @@ class Session:
         native session ratchet as usual.
         """
         self._check_initialized()
+        raw_ciphertext = _raw_ciphertext(message.ciphertext)
         stashed = self._stashed_prekey_plaintext
         if (
             stashed is not None
             and message.message_type == 0
-            and message.ciphertext == stashed[0]
+            and raw_ciphertext == stashed[0]
         ):
             self._stashed_prekey_plaintext = None
             _PENDING_PREKEY_PLAINTEXTS.pop((self.id, stashed[0]), None)
@@ -321,12 +348,12 @@ class Session:
         # per-instance stash is gone, but the registry entry keyed by the native
         # session id survives; serve the pending pre-key plaintext exactly once.
         if message.message_type == 0:
-            pending = _PENDING_PREKEY_PLAINTEXTS.pop((self.id, message.ciphertext), None)
+            pending = _PENDING_PREKEY_PLAINTEXTS.pop((self.id, raw_ciphertext), None)
             if pending is not None:
                 self._stashed_prekey_plaintext = None
                 return pending.decode("utf-8")
         try:
-            plaintext_bytes = self._native.decrypt(message.message_type, message.ciphertext)
+            plaintext_bytes = self._native.decrypt(message.message_type, raw_ciphertext)
         except _NativeOlmSessionError as exc:
             raise OlmSessionError(str(exc)) from exc
         return plaintext_bytes.decode("utf-8")
@@ -338,7 +365,7 @@ class Session:
             return False
         if message.message_type != 0:
             return False
-        return self._native.matches_prekey(message.ciphertext)
+        return self._native.matches_prekey(_raw_ciphertext(message.ciphertext))
 
     def describe(self) -> str:
         """Return a human-readable description of the session."""
